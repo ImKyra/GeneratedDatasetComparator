@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QStatusBar,
     QLineEdit,
+    QSlider,
+    QCheckBox,
 )
 
 try:
@@ -142,6 +144,14 @@ class DatasetScanner:
 
     def match_generated_to_original(self, originals: List[OriginalItem], generated: List[GeneratedItem]) -> Dict[
         Path, List[GeneratedItem]]:
+        # Build a lookup for generated items by stem for filename matching
+        gen_by_stem: Dict[str, List[GeneratedItem]] = {}
+        for g in generated:
+            stem = g.image_path.stem.lower()
+            if stem not in gen_by_stem:
+                gen_by_stem[stem] = []
+            gen_by_stem[stem].append(g)
+
         # Prepare normalized prompts for generated items
         gen_norm: List[Tuple[GeneratedItem, str]] = []
         for g in generated:
@@ -151,49 +161,56 @@ class DatasetScanner:
 
         mapping: Dict[Path, List[GeneratedItem]] = {}
         for o in originals:
-            o_norm = self._normalize_prompt(o.prompt_text)
-            if not o_norm:
-                mapping[o.image_path] = []
-                continue
+            o_stem = o.image_path.stem.lower()
 
-            # Fast matching with early exits
-            exact_matches: List[GeneratedItem] = []
+            # Priority 1: Filename match (preserves association even after prompt edits)
+            filename_matches = gen_by_stem.get(o_stem, [])
+
+            # Priority 2: Prompt-based matching
+            o_norm = self._normalize_prompt(o.prompt_text)
+            prompt_exact_matches: List[GeneratedItem] = []
             fuzzy_matches: List[Tuple[float, GeneratedItem]] = []
 
-            for g, g_norm in gen_norm:
-                # Quick exact match checks first
-                if o_norm == g_norm:
-                    exact_matches.append(g)
-                    continue
+            if o_norm:
+                for g, g_norm in gen_norm:
+                    # Skip if already matched by filename
+                    if g in filename_matches:
+                        continue
 
-                # Fast substring checks
-                if o_norm in g_norm or g_norm in o_norm:
-                    exact_matches.append(g)
-                    continue
+                    # Quick exact match checks first
+                    if o_norm == g_norm:
+                        prompt_exact_matches.append(g)
+                        continue
 
-                # Only do expensive fuzzy matching if strings are similar length
-                # and share some common words (optimization)
-                len_diff = abs(len(o_norm) - len(g_norm)) / max(len(o_norm), len(g_norm), 1)
-                if len_diff > 0.5:  # Skip if length difference > 50%
-                    continue
+                    # Fast substring checks
+                    if o_norm in g_norm or g_norm in o_norm:
+                        prompt_exact_matches.append(g)
+                        continue
 
-                # Quick word overlap check
-                o_words = set(o_norm.split())
-                g_words = set(g_norm.split())
-                if not o_words or not g_words:
-                    continue
+                    # Only do expensive fuzzy matching if strings are similar length
+                    # and share some common words (optimization)
+                    len_diff = abs(len(o_norm) - len(g_norm)) / max(len(o_norm), len(g_norm), 1)
+                    if len_diff > 0.5:  # Skip if length difference > 50%
+                        continue
 
-                word_overlap = len(o_words & g_words) / len(o_words | g_words)
-                if word_overlap < 0.3:  # Skip if word overlap < 30%
-                    continue
+                    # Quick word overlap check
+                    o_words = set(o_norm.split())
+                    g_words = set(g_norm.split())
+                    if not o_words or not g_words:
+                        continue
 
-                # Only now do the expensive similarity calculation
-                score = difflib.SequenceMatcher(None, o_norm, g_norm).ratio()
-                if score >= 0.85:  # Lowered threshold since we pre-filter
-                    fuzzy_matches.append((score, g))
+                    word_overlap = len(o_words & g_words) / len(o_words | g_words)
+                    if word_overlap < 0.3:  # Skip if word overlap < 30%
+                        continue
 
-            # Combine results: exact matches first, then fuzzy matches by score
-            result = exact_matches[:]
+                    # Only now do the expensive similarity calculation
+                    score = difflib.SequenceMatcher(None, o_norm, g_norm).ratio()
+                    if score >= 0.85:  # Lowered threshold since we pre-filter
+                        fuzzy_matches.append((score, g))
+
+            # Combine results: filename matches first, then prompt matches, then fuzzy
+            result = filename_matches[:]
+            result.extend(prompt_exact_matches)
             fuzzy_matches.sort(key=lambda x: (-x[0], x[1].image_path.name.lower()))
             result.extend([g for _, g in fuzzy_matches])
 
@@ -221,74 +238,35 @@ class ImageLoader:
             self.cache.clear()
 
         try:
-            # Load and process image safely
             with Image.open(path) as pil_image:
-                # Always convert to RGB first to ensure consistent format
+                # Handle transparency by compositing on white background
                 if pil_image.mode in ('RGBA', 'LA'):
-                    # Handle transparency properly
                     background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                    if pil_image.mode == 'RGBA':
-                        background.paste(pil_image, mask=pil_image.split()[-1])
-                    else:  # LA mode
-                        background.paste(pil_image, mask=pil_image.split()[-1])
+                    background.paste(pil_image, mask=pil_image.split()[-1])
                     pil_image = background
-                elif pil_image.mode not in ('RGB', 'L'):
+                elif pil_image.mode != 'RGB':
                     pil_image = pil_image.convert('RGB')
 
-                # Create a copy to ensure we own the data
+                # Copy and resize
                 pil_image = pil_image.copy()
-
-                # Resize image to fit available space while maintaining aspect ratio
                 pil_image.thumbnail(target_size, Image.LANCZOS)
 
-                # Convert to QPixmap safely
-                if pil_image.mode == 'RGB':
-                    # RGB format
-                    width, height = pil_image.size
-                    bytes_per_line = width * 3
-                    qimg = QImage(
-                        pil_image.tobytes(),
-                        width,
-                        height,
-                        bytes_per_line,
-                        QImage.Format_RGB888
-                    )
-                elif pil_image.mode == 'L':
-                    # Grayscale - convert to RGB to avoid display issues
-                    pil_image = pil_image.convert('RGB')
-                    width, height = pil_image.size
-                    bytes_per_line = width * 3
-                    qimg = QImage(
-                        pil_image.tobytes(),
-                        width,
-                        height,
-                        bytes_per_line,
-                        QImage.Format_RGB888
-                    )
-                else:
-                    # Fallback - force RGB conversion
-                    pil_image = pil_image.convert('RGB')
-                    width, height = pil_image.size
-                    bytes_per_line = width * 3
-                    qimg = QImage(
-                        pil_image.tobytes(),
-                        width,
-                        height,
-                        bytes_per_line,
-                        QImage.Format_RGB888
-                    )
+                # Convert to QPixmap
+                width, height = pil_image.size
+                qimg = QImage(
+                    pil_image.tobytes(),
+                    width,
+                    height,
+                    width * 3,
+                    QImage.Format_RGB888
+                )
+                pix = QPixmap.fromImage(qimg.copy())
 
-                # Create a deep copy of QImage to avoid memory issues
-                qimg_copy = qimg.copy()
-                pix = QPixmap.fromImage(qimg_copy)
-
-                # Cache the result
                 self.cache[key] = pix
                 return pix
 
         except Exception as e:
             print(f"Error loading image {path}: {e}")
-            # Return a placeholder pixmap instead of None
             placeholder = QPixmap(100, 100)
             placeholder.fill(Qt.lightGray)
             return placeholder
@@ -331,6 +309,16 @@ class MainWindow(QMainWindow):
             top_row.addWidget(w)
         top_row.addStretch(1)
         root_layout.addLayout(top_row)
+
+        # Import checkbox row (below generated folder button)
+        import_row = QHBoxLayout()
+        import_row.addWidget(QLabel(""))  # Spacer to align with generated folder section
+        import_row.addWidget(self.lbl_orig)  # Align checkbox under generated button
+        self.chk_import = QCheckBox("Import")
+        self.chk_import.setToolTip("Create 'generated' subdirectory in original dataset folder and import files there")
+        import_row.addWidget(self.chk_import)
+        import_row.addStretch(1)
+        root_layout.addLayout(import_row)
 
         self.btn_load_orig.clicked.connect(self.choose_original)
         self.btn_load_gen.clicked.connect(self.choose_generated)
@@ -407,6 +395,21 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_save_prompt)
         btn_row.addWidget(self.btn_rematch)
         btn_row.addStretch(1)
+
+        # Font size slider
+        font_size_label = QLabel("Font:")
+        self.font_slider = QSlider(Qt.Horizontal)
+        self.font_slider.setMinimum(8)
+        self.font_slider.setMaximum(24)
+        self.font_slider.setValue(10)
+        self.font_slider.setMaximumWidth(100)
+        self.font_slider.valueChanged.connect(self.on_font_size_changed)
+        self.font_size_label = QLabel("10pt")
+        self.font_size_label.setMinimumWidth(35)
+        btn_row.addWidget(font_size_label)
+        btn_row.addWidget(self.font_slider)
+        btn_row.addWidget(self.font_size_label)
+
         prompt_layout.addLayout(btn_row)
         center_split.addWidget(prompt_widget)
 
@@ -688,6 +691,17 @@ class MainWindow(QMainWindow):
 
             layout.addWidget(img_label, 1)  # Give maximum stretch to image
 
+            # Rename button and filename info
+            info_layout = QHBoxLayout()
+            file_info = QLabel(f"File: {g.image_path.name}")
+            file_info.setTextFormat(Qt.PlainText)
+            rename_btn = QPushButton("Rename to Match")
+            rename_btn.setMaximumWidth(120)
+            rename_btn.clicked.connect(lambda checked, gen_item=g: self.rename_generated_to_match(gen_item))
+            info_layout.addWidget(file_info, 1)
+            info_layout.addWidget(rename_btn)
+            layout.addLayout(info_layout)
+
             # Prompt snippet
             snippet = (g.prompt_text or "<no prompt in metadata>").strip()
             if len(snippet) > 150:
@@ -697,10 +711,10 @@ class MainWindow(QMainWindow):
             snippet_label.setTextFormat(Qt.PlainText)
             snippet_label.setText(snippet)
             snippet_label.setWordWrap(True)
-            snippet_label.setMaximumHeight(80)  # Limit height
+            snippet_label.setMaximumHeight(60)  # Reduced height for button space
             layout.addWidget(snippet_label, 0)  # No stretch for text
 
-            # Short tab name
+            # Short tab name with indicator if filename already matches
             tab_name = g.image_path.stem
             if len(tab_name) > 12:
                 tab_name = tab_name[:9] + "..."
@@ -717,11 +731,68 @@ class MainWindow(QMainWindow):
             info_layout.addWidget(info_label)
             self.tabs_generated.addTab(info_tab, f"+{len(items) - max_tabs}")
 
-    def save_prompt(self) -> None:
-        row = self.list_originals.currentRow()
-        if row < 0 or row >= len(self.displayed_items):
+    def rename_generated_to_match(self, gen_item: GeneratedItem) -> None:
+        """Rename a generated file to match the currently selected original item"""
+        display_row = self.list_originals.currentRow()
+        if display_row < 0 or display_row >= len(self.displayed_items):
+            QMessageBox.warning(self, "No Selection", "Please select an original item first.")
             return
-        item = self.displayed_items[row]
+
+        orig_item = self.displayed_items[display_row]
+
+        # Get the target filename (same stem as original, keep generated extension)
+        target_stem = orig_item.image_path.stem
+        current_ext = gen_item.image_path.suffix
+        target_name = target_stem + current_ext
+        target_path = gen_item.image_path.parent / target_name
+
+        # Check if already has the correct name
+        if gen_item.image_path.name.lower() == target_name.lower():
+            self.statusBar().showMessage("File already has matching name", 2000)
+            return
+
+        # Check for conflicts
+        if target_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "File Exists",
+                f"A file named '{target_name}' already exists in the generated folder.\n\n"
+                f"Do you want to replace it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
+            # Rename the file
+            gen_item.image_path.rename(target_path)
+
+            # Update the GeneratedItem in our list
+            for idx, g in enumerate(self.generated_items):
+                if g.image_path == gen_item.image_path:
+                    self.generated_items[idx] = GeneratedItem(
+                        image_path=target_path,
+                        prompt_text=g.prompt_text
+                    )
+                    break
+
+            # Clear cache to prevent stale image data
+            self.image_loader.clear_cache()
+
+            # Re-match and refresh display
+            self.rematch_only()
+
+            self.statusBar().showMessage(f"Renamed to: {target_name}", 3000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Rename Error", f"Failed to rename file:\n{e}")
+
+    def save_prompt(self) -> None:
+        display_row = self.list_originals.currentRow()
+        if display_row < 0 or display_row >= len(self.displayed_items):
+            return
+        item = self.displayed_items[display_row]
         old_text = item.prompt_text
         new_text = self.txt_prompt.toPlainText().strip()
 
@@ -733,14 +804,22 @@ class MainWindow(QMainWindow):
         try:
             item.prompt_path.parent.mkdir(parents=True, exist_ok=True)
             item.prompt_path.write_text(new_text, encoding="utf-8")
-            # update in-memory - find the item in original_items and update it
+            # update in-memory - find the item in original_items by image_path
+            orig_idx = None
             for idx, orig_item in enumerate(self.original_items):
                 if orig_item.image_path == item.image_path:
                     self.original_items[idx] = OriginalItem(image_path=item.image_path, prompt_path=item.prompt_path,
                                                             prompt_text=new_text)
-                    # Only re-match this specific item instead of everything
-                    self.rematch_single_item(idx)
+                    orig_idx = idx
                     break
+
+            # Update the displayed item as well
+            self.displayed_items[display_row] = OriginalItem(image_path=item.image_path, prompt_path=item.prompt_path,
+                                                             prompt_text=new_text)
+
+            # Re-match and update display using the original items index and display row
+            if orig_idx is not None:
+                self.rematch_single_item(orig_idx, display_row)
 
             self.statusBar().showMessage(f"Saved: {item.prompt_path}", 3000)
         except Exception as e:
@@ -751,12 +830,24 @@ class MainWindow(QMainWindow):
         self.filter_text = text
         self.populate_original_list()
 
-    def rematch_single_item(self, row: int) -> None:
-        """Re-match only a specific original item instead of all items"""
-        if row < 0 or row >= len(self.original_items):
+    def rematch_single_item(self, orig_idx: int, display_row: int = -1) -> None:
+        """Re-match only a specific original item instead of all items
+
+        Args:
+            orig_idx: Index in self.original_items
+            display_row: Optional index in displayed list for UI update
+        """
+        if orig_idx < 0 or orig_idx >= len(self.original_items):
             return
 
-        item = self.original_items[row]
+        item = self.original_items[orig_idx]
+        o_stem = item.image_path.stem.lower()
+
+        # Priority 1: Filename match
+        filename_matches: List[GeneratedItem] = []
+        for g in self.generated_items:
+            if g.image_path.stem.lower() == o_stem:
+                filename_matches.append(g)
 
         # Prepare normalized prompts for generated items (reuse existing logic)
         gen_norm: List[Tuple[GeneratedItem, str]] = []
@@ -765,24 +856,25 @@ class MainWindow(QMainWindow):
             if norm:
                 gen_norm.append((g, norm))
 
-        # Match this single item using the same logic as match_generated_to_original
+        # Priority 2: Prompt-based matching
         o_norm = self.scanner._normalize_prompt(item.prompt_text)
-        if not o_norm:
-            self.matches[item.image_path] = []
-        else:
-            # Fast matching with early exits (same as original logic)
-            exact_matches: List[GeneratedItem] = []
-            fuzzy_matches: List[Tuple[float, GeneratedItem]] = []
+        prompt_exact_matches: List[GeneratedItem] = []
+        fuzzy_matches: List[Tuple[float, GeneratedItem]] = []
 
+        if o_norm:
             for g, g_norm in gen_norm:
+                # Skip if already matched by filename
+                if g in filename_matches:
+                    continue
+
                 # Quick exact match checks first
                 if o_norm == g_norm:
-                    exact_matches.append(g)
+                    prompt_exact_matches.append(g)
                     continue
 
                 # Fast substring checks
                 if o_norm in g_norm or g_norm in o_norm:
-                    exact_matches.append(g)
+                    prompt_exact_matches.append(g)
                     continue
 
                 # Only do expensive fuzzy matching if strings are similar length
@@ -807,22 +899,31 @@ class MainWindow(QMainWindow):
                 if score >= 0.85:  # Lowered threshold since we pre-filter
                     fuzzy_matches.append((score, g))
 
-            # Combine results: exact matches first, then fuzzy matches by score
-            result = exact_matches[:]
-            fuzzy_matches.sort(key=lambda x: (-x[0], x[1].image_path.name.lower()))
-            result.extend([g for _, g in fuzzy_matches])
+        # Combine results: filename matches first, then prompt matches, then fuzzy
+        result = filename_matches[:]
+        result.extend(prompt_exact_matches)
+        fuzzy_matches.sort(key=lambda x: (-x[0], x[1].image_path.name.lower()))
+        result.extend([g for _, g in fuzzy_matches])
 
-            self.matches[item.image_path] = result
+        self.matches[item.image_path] = result
 
-        # Update only the specific list item's display text
+        # Update the display text if we have a valid display row
         match_count = len(self.matches.get(item.image_path, []))
-        lw_item = self.list_originals.item(row)
-        if lw_item is not None:
-            lw_item.setText(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
+        if display_row >= 0:
+            lw_item = self.list_originals.item(display_row)
+            if lw_item is not None:
+                lw_item.setText(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
 
-        # Refresh the generated tabs for the current selection if it's the same item
-        if self.list_originals.currentRow() == row:
-            self.populate_generated_tabs(self.matches.get(item.image_path, []))
+            # Refresh the generated tabs for the current selection if it's the same item
+            if self.list_originals.currentRow() == display_row:
+                self.populate_generated_tabs(self.matches.get(item.image_path, []))
+
+    def on_font_size_changed(self, value: int) -> None:
+        """Update font size for the prompt text editor"""
+        self.font_size_label.setText(f"{value}pt")
+        font = self.txt_prompt.font()
+        font.setPointSize(value)
+        self.txt_prompt.setFont(font)
 
     def closeEvent(self, event):
         """Clean up resources when closing"""
