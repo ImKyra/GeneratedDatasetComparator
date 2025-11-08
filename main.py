@@ -491,7 +491,7 @@ class MainWindow(QMainWindow):
                         continue
 
                 match_count = len(self.matches.get(item.image_path, []))
-                lw = QListWidgetItem(f"{item.image_path.name}  ({match_count} match{'es' if match_count!=1 else ''})")
+                lw = QListWidgetItem(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
                 self.list_originals.addItem(lw)
                 self.displayed_items.append(item)
                 displayed_count += 1
@@ -502,10 +502,11 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_list_count.setText(f"{displayed_count} items")
 
-            if self.list_originals.count() > 0:
-                self.list_originals.setCurrentRow(0)
         finally:
             self._updating_selection = False
+
+        if self.list_originals.count() > 0:
+            self.list_originals.setCurrentRow(0)
 
     def rematch_with_progress(self) -> None:
         """Perform matching with progress dialog."""
