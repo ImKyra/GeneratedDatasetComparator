@@ -4,7 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QLineEdit,
     QSlider,
+    QProgressDialog,
 )
 
 from items import OriginalItem, GeneratedItem
@@ -58,6 +59,11 @@ class MainWindow(QMainWindow):
 
         self.search_replace_dialog: Optional[SearchReplaceDialog] = None
 
+        # Debounce timer for filter text input
+        self.filter_timer = QTimer()
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.timeout.connect(self._apply_filter)
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -67,12 +73,12 @@ class MainWindow(QMainWindow):
 
         # Toolbar-like row
         top_row = QHBoxLayout()
-        self.btn_load_orig = QPushButton("Load Original Folder")
-        self.lbl_orig = QLabel("Original: <not set>")
-        self.btn_load_gen = QPushButton("Load Generated Folder")
+        self.btn_load_orig = QPushButton("Dataset")
+        self.lbl_orig = QLabel("Dataset: <not set>")
+        self.btn_load_gen = QPushButton("Generated Pictures")
         self.lbl_gen = QLabel("Generated: <not set>")
         self.btn_rescan = QPushButton("Scan/Match")
-        self.btn_import = QPushButton("Import Generated")
+        self.btn_import = QPushButton("Import Generated Pictures")
 
         for w in (self.btn_load_orig, self.lbl_orig, self.btn_load_gen, self.lbl_gen, self.btn_rescan, self.btn_import):
             top_row.addWidget(w)
@@ -180,7 +186,7 @@ class MainWindow(QMainWindow):
         center_split.addWidget(prompt_widget)
 
         self.btn_save_prompt.clicked.connect(self.save_prompt)
-        self.btn_rematch.clicked.connect(self.rematch_only)
+        self.btn_rematch.clicked.connect(self.rematch_with_progress)
 
         # Add Ctrl+S shortcut for saving prompts
         self.save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
@@ -203,7 +209,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.original_root = Path(path)
-        self.lbl_orig.setText(f"Original: {self.original_root}")
+        self.lbl_orig.setText(f"Dataset: {self.original_root}")
 
         self.statusBar().showMessage("Scanning original dataset...")
         QApplication.processEvents()
@@ -220,7 +226,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             self.generated_items = self.scanner.scan_generated_dataset(self.generated_root)
             has_prompt = sum(1 for g in self.generated_items if g.prompt_text)
-            self.statusBar().showMessage(f"Auto-detected 'generated' subdirectory. Found {len(self.generated_items)} generated images ({has_prompt} with prompts). Click 'Scan/Match' to match.", 5000)
+            self.statusBar().showMessage(f"Auto-detected 'generated' subdirectory. Found {len(self.generated_items)} generated images ({has_prompt} with prompts). Click 'Scan/Match' to start matching.", 5000)
 
     def choose_generated(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Generated Dataset Folder")
@@ -421,7 +427,7 @@ class MainWindow(QMainWindow):
         if self.generated_root:
             self.rescan_generated()
         if self.original_root and self.generated_root:
-            self.rematch_only()
+            self.rematch_with_progress()
 
     def _parse_filter_text(self, filter_text: str) -> Tuple[List[str], List[str], List[str]]:
         include_words = []
@@ -429,10 +435,20 @@ class MainWindow(QMainWindow):
         phrases = []
 
         import shlex
+        import re
+
+        # Extract quoted phrases first (before any splitting)
+        phrase_pattern = r'"([^"]+)"'
+        for match in re.finditer(phrase_pattern, filter_text):
+            phrases.append(match.group(1).lower())
+
+        # Remove quoted phrases from the text before tokenizing
+        remaining_text = re.sub(phrase_pattern, '', filter_text)
+
         try:
-            tokens = shlex.split(filter_text.lower())
+            tokens = shlex.split(remaining_text.lower())
         except ValueError:
-            tokens = filter_text.lower().split()
+            tokens = remaining_text.lower().split()
 
         for token in tokens:
             token = token.strip()
@@ -443,63 +459,136 @@ class MainWindow(QMainWindow):
                 exclude_word = token[1:].strip()
                 if exclude_word:
                     exclude_words.append(exclude_word)
-            elif ' ' in token:
-                phrases.append(token)
             else:
                 include_words.append(token)
 
         return include_words, exclude_words, phrases
 
     def populate_original_list(self) -> None:
-        self.list_originals.clear()
-        self.displayed_items.clear()
+        if self._updating_selection:
+            return
 
-        include_words, exclude_words, phrases = self._parse_filter_text(self.filter_text)
-        has_filter = include_words or exclude_words or phrases
+        self._updating_selection = True
+        try:
+            self.list_originals.clear()
+            self.displayed_items.clear()
 
-        displayed_count = 0
-        for item in self.original_items:
+            include_words, exclude_words, phrases = self._parse_filter_text(self.filter_text)
+            has_filter = include_words or exclude_words or phrases
+
+            displayed_count = 0
+            for item in self.original_items:
+                if has_filter:
+                    prompt_lower = (item.prompt_text or "").lower()
+
+                    if any(word in prompt_lower for word in exclude_words):
+                        continue
+
+                    if include_words and not all(word in prompt_lower for word in include_words):
+                        continue
+
+                    if phrases and not all(phrase in prompt_lower for phrase in phrases):
+                        continue
+
+                match_count = len(self.matches.get(item.image_path, []))
+                lw = QListWidgetItem(f"{item.image_path.name}  ({match_count} match{'es' if match_count!=1 else ''})")
+                self.list_originals.addItem(lw)
+                self.displayed_items.append(item)
+                displayed_count += 1
+
+            total_count = len(self.original_items)
             if has_filter:
-                prompt_lower = (item.prompt_text or "").lower()
+                self.lbl_list_count.setText(f"{displayed_count} of {total_count} items (filtered)")
+            else:
+                self.lbl_list_count.setText(f"{displayed_count} items")
 
-                if any(word in prompt_lower for word in exclude_words):
-                    continue
+            if self.list_originals.count() > 0:
+                self.list_originals.setCurrentRow(0)
+        finally:
+            self._updating_selection = False
 
-                if include_words and not all(word in prompt_lower for word in include_words):
-                    continue
+    def rematch_with_progress(self) -> None:
+        """Perform matching with progress dialog."""
+        if not self.original_items or not self.generated_items:
+            return
 
-                if phrases and not all(phrase in prompt_lower for phrase in phrases):
-                    continue
+        # Create progress dialog
+        progress = QProgressDialog("Initializing matching...", "Cancel", 0, len(self.original_items), self)
+        progress.setWindowTitle("Matching Images to Prompts")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)  # Show immediately
+        progress.show()
 
-            match_count = len(self.matches.get(item.image_path, []))
-            lw = QListWidgetItem(f"{item.image_path.name}  ({match_count} match{'es' if match_count!=1 else ''})")
-            self.list_originals.addItem(lw)
-            self.displayed_items.append(item)
-            displayed_count += 1
+        # Keep track of cancellation
+        cancelled = False
 
-        total_count = len(self.original_items)
-        if has_filter:
-            self.lbl_list_count.setText(f"{displayed_count} of {total_count} items (filtered)")
-        else:
-            self.lbl_list_count.setText(f"{displayed_count} items")
+        def progress_callback(current: int, total: int, message: str) -> bool:
+            nonlocal cancelled
 
-        if self.list_originals.count() > 0:
-            self.list_originals.setCurrentRow(0)
+            # Update progress dialog
+            progress.setValue(current)
+            progress.setLabelText(message)
 
-    def rematch_only(self) -> None:
-        self.statusBar().showMessage("Matching images to prompts...")
-        QApplication.processEvents()
+            # Process events to keep UI responsive
+            QApplication.processEvents()
 
-        self.matches = self.scanner.match_generated_to_original(self.original_items, self.generated_items)
+            # Check if user cancelled
+            if progress.wasCanceled():
+                cancelled = True
+                return False
 
-        for row, item in enumerate(self.original_items):
-            match_count = len(self.matches.get(item.image_path, []))
-            lw_item = self.list_originals.item(row)
-            if lw_item is not None:
-                lw_item.setText(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
+            return True
 
-        self.on_select_original(self.list_originals.currentRow())
-        self.statusBar().showMessage("Ready")
+        try:
+            # Perform matching with progress reporting
+            matches = self.matching_engine.match_all_items(
+                self.original_items,
+                self.generated_items,
+                progress_callback
+            )
+
+            if cancelled or matches is None:
+                self.statusBar().showMessage("Matching cancelled by user", 3000)
+                return
+
+            # Update matches and UI
+            self.matches = matches
+
+            # Update list items with match counts
+            for row in range(len(self.displayed_items)):
+                item = self.displayed_items[row]
+                match_count = len(self.matches.get(item.image_path, []))
+                lw_item = self.list_originals.item(row)
+                if lw_item is not None:
+                    lw_item.setText(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
+
+            # Refresh current selection
+            self.on_select_original(self.list_originals.currentRow())
+
+            total_matches = sum(len(match_list) for match_list in self.matches.values())
+            self.statusBar().showMessage(
+                f"Matching complete! Found {total_matches} total matches across {len(self.matches)} items", 5000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Matching Error", f"An error occurred during matching:\n{str(e)}")
+            self.statusBar().showMessage("Matching failed", 3000)
+        finally:
+            progress.close()
+
+    # def rematch_only(self) -> None:
+    #     self.statusBar().showMessage("Matching images to prompts...")
+    #     QApplication.processEvents()
+    #
+    #     self.matches = self.scanner.match_generated_to_original(self.original_items, self.generated_items)
+    #
+    #     for row, item in enumerate(self.original_items):
+    #         match_count = len(self.matches.get(item.image_path, []))
+    #         lw_item = self.list_originals.item(row)
+    #         if lw_item is not None:
+    #             lw_item.setText(f"{item.image_path.name}  ({match_count} match{'es' if match_count != 1 else ''})")
+    #
+    #     self.on_select_original(self.list_originals.currentRow())
+    #     self.statusBar().showMessage("Ready")
 
     def on_select_original(self, row: int) -> None:
         if self._updating_selection:
@@ -712,6 +801,12 @@ class MainWindow(QMainWindow):
 
     def on_filter_changed(self, text: str) -> None:
         self.filter_text = text
+        # Restart the debounce timer - only apply filter after typing stops for 300ms
+        self.filter_timer.stop()
+        self.filter_timer.start(300)
+
+    def _apply_filter(self) -> None:
+        """Called after debounce timer expires to actually apply the filter"""
         self.populate_original_list()
 
     def rematch_single_item(self, orig_idx: int, display_row: int = -1) -> None:
