@@ -9,12 +9,16 @@ try:
 except Exception:
     raise SystemExit("Pillow is required. Please install with: pip install Pillow")
 
+# Constants
+DEFAULT_MAX_SIZE = (1200, 1200)
+MAX_CACHE_SIZE = 15
+
 
 class ImageLoader:
-    def __init__(self, max_size: Tuple[int, int] = (1200, 1200)):
+    def __init__(self, max_size: Tuple[int, int] = DEFAULT_MAX_SIZE):
         self.max_size = max_size
         self.cache: Dict[Tuple[Path, Tuple[int, int]], QPixmap] = {}
-        self.max_cache_size = 15
+        self.max_cache_size = MAX_CACHE_SIZE
 
     def clear_cache(self) -> None:
         self.cache.clear()
@@ -37,7 +41,7 @@ class ImageLoader:
                     pil_image = pil_image.convert('RGB')
 
                 pil_image = pil_image.copy()
-                pil_image.thumbnail(target_size, Image.LANCZOS)
+                pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
 
                 width, height = pil_image.size
                 qimg = QImage(

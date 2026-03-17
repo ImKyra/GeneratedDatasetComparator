@@ -117,8 +117,3 @@ class SearchReplaceDialog(QDialog):
         self.chk_case_sensitive.setChecked(self.last_case_sensitive)
         self.txt_search.setFocus()
         self.txt_search.selectAll()
-
-    def focusOutEvent(self, event):
-        if not self.isAncestorOf(QApplication.focusWidget()):
-            self.close()
-        super().focusOutEvent(event)

@@ -6,6 +6,11 @@ from pathlib import Path
 from items import OriginalItem, GeneratedItem
 from dataset_scanner import DatasetScanner
 
+# Matching thresholds
+LENGTH_DIFF_THRESHOLD = 0.5
+WORD_OVERLAP_THRESHOLD = 0.3
+FUZZY_SCORE_THRESHOLD = 0.85
+
 
 class MatchingEngine:
     def __init__(self, scanner: DatasetScanner):
@@ -114,7 +119,7 @@ class MatchingEngine:
                 # Quick length check first (cheapest operation)
                 g_len = len(g_norm)
                 len_diff = abs(o_len - g_len) / max(o_len, g_len, 1)
-                if len_diff > 0.5:
+                if len_diff > LENGTH_DIFF_THRESHOLD:
                     continue
 
                 # Exact match checks (cheap string operations)
@@ -128,15 +133,17 @@ class MatchingEngine:
                     continue
 
                 word_overlap = len(o_words & g_words) / len(o_words | g_words)
-                if word_overlap >= 0.3:
+                if word_overlap >= WORD_OVERLAP_THRESHOLD:
                     fuzzy_candidates.append(item_g)
 
         # Only run expensive fuzzy matching on pre-filtered candidates
         fuzzy_matches: List[Tuple[float, GeneratedItem]] = []
         for candidate in fuzzy_candidates:
-            g_norm = self._normalized_prompts[candidate.image_path]  # Use path as key
+            g_norm = self._normalized_prompts.get(candidate.image_path)  # Use path as key
+            if not g_norm:
+                continue
             score = difflib.SequenceMatcher(None, o_norm, g_norm).ratio()
-            if score >= 0.85:
+            if score >= FUZZY_SCORE_THRESHOLD:
                 fuzzy_matches.append((score, candidate))
 
         # Combine results

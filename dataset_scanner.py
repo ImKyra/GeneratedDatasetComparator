@@ -2,7 +2,7 @@ import os
 import re
 import difflib
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 try:
     from PIL import Image
@@ -13,6 +13,11 @@ from items import OriginalItem, GeneratedItem
 
 SUPPORTED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 GENERATED_IMG_EXTS = {".png"}
+
+# Matching thresholds
+LENGTH_DIFF_THRESHOLD = 0.5
+WORD_OVERLAP_THRESHOLD = 0.3
+FUZZY_SCORE_THRESHOLD = 0.85
 
 
 class DatasetScanner:
@@ -135,7 +140,7 @@ class DatasetScanner:
                         continue
 
                     len_diff = abs(len(o_norm) - len(g_norm)) / max(len(o_norm), len(g_norm), 1)
-                    if len_diff > 0.5:
+                    if len_diff > LENGTH_DIFF_THRESHOLD:
                         continue
 
                     o_words = set(o_norm.split())
@@ -144,11 +149,11 @@ class DatasetScanner:
                         continue
 
                     word_overlap = len(o_words & g_words) / len(o_words | g_words)
-                    if word_overlap < 0.3:
+                    if word_overlap < WORD_OVERLAP_THRESHOLD:
                         continue
 
                     score = difflib.SequenceMatcher(None, o_norm, g_norm).ratio()
-                    if score >= 0.85:
+                    if score >= FUZZY_SCORE_THRESHOLD:
                         fuzzy_matches.append((score, g))
 
             result = filename_matches[:]
