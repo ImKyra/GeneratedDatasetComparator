@@ -1,6 +1,5 @@
 import os
 import re
-import difflib
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -13,11 +12,6 @@ from items import OriginalItem, GeneratedItem
 
 SUPPORTED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 GENERATED_IMG_EXTS = {".png"}
-
-# Matching thresholds
-LENGTH_DIFF_THRESHOLD = 0.5
-WORD_OVERLAP_THRESHOLD = 0.3
-FUZZY_SCORE_THRESHOLD = 0.85
 
 
 class DatasetScanner:
@@ -105,62 +99,3 @@ class DatasetScanner:
                     items.append(GeneratedItem(image_path=p, prompt_text=prompt))
         items.sort(key=lambda it: str(it.image_path).lower())
         return items
-
-    def match_generated_to_original(self, originals: List[OriginalItem], generated: List[GeneratedItem]) -> Dict[
-        Path, List[GeneratedItem]]:
-        gen_by_stem: Dict[str, List[GeneratedItem]] = {}
-        for g in generated:
-            stem = g.image_path.stem.lower()
-            if stem not in gen_by_stem:
-                gen_by_stem[stem] = []
-            gen_by_stem[stem].append(g)
-
-        gen_norm: List[Tuple[GeneratedItem, str]] = []
-        for g in generated:
-            norm = self._normalize_prompt(g.prompt_text)
-            if norm:
-                gen_norm.append((g, norm))
-
-        mapping: Dict[Path, List[GeneratedItem]] = {}
-        for o in originals:
-            o_stem = o.image_path.stem.lower()
-            filename_matches = gen_by_stem.get(o_stem, [])
-
-            o_norm = self._normalize_prompt(o.prompt_text)
-            prompt_exact_matches: List[GeneratedItem] = []
-            fuzzy_matches: List[Tuple[float, GeneratedItem]] = []
-
-            if o_norm:
-                for g, g_norm in gen_norm:
-                    if g in filename_matches:
-                        continue
-
-                    if o_norm == g_norm or o_norm in g_norm or g_norm in o_norm:
-                        prompt_exact_matches.append(g)
-                        continue
-
-                    len_diff = abs(len(o_norm) - len(g_norm)) / max(len(o_norm), len(g_norm), 1)
-                    if len_diff > LENGTH_DIFF_THRESHOLD:
-                        continue
-
-                    o_words = set(o_norm.split())
-                    g_words = set(g_norm.split())
-                    if not o_words or not g_words:
-                        continue
-
-                    word_overlap = len(o_words & g_words) / len(o_words | g_words)
-                    if word_overlap < WORD_OVERLAP_THRESHOLD:
-                        continue
-
-                    score = difflib.SequenceMatcher(None, o_norm, g_norm).ratio()
-                    if score >= FUZZY_SCORE_THRESHOLD:
-                        fuzzy_matches.append((score, g))
-
-            result = filename_matches[:]
-            result.extend(prompt_exact_matches)
-            fuzzy_matches.sort(key=lambda x: (-x[0], x[1].image_path.name.lower()))
-            result.extend([g for _, g in fuzzy_matches])
-
-            mapping[o.image_path] = result
-
-        return mapping

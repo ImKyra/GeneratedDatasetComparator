@@ -40,12 +40,33 @@ from prompt_manager import PromptManager
 from matching_engine import MatchingEngine
 from search_replace_dialog import SearchReplaceDialog
 
-# Constants
 MAX_GENERATED_TABS = 8
 FILTER_DEBOUNCE_MS = 300
 DEFAULT_FONT_SIZE = 10
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 24
+
+
+def _scale_generated_image(label: QLabel) -> None:
+    pix = label.property("original_pixmap")
+    if pix and not pix.isNull():
+        parent = label.parentWidget()
+        if parent:
+            available_height = parent.height() - 100
+            available_width = parent.width() - 20
+            target_size = QSize(max(100, available_width), max(100, available_height))
+        else:
+            target_size = label.size()
+
+        if target_size.width() > 50 and target_size.height() > 50:
+            scaled_pix = pix.scaled(
+                target_size,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            label.setPixmap(scaled_pix)
+        else:
+            label.setPixmap(pix)
 
 
 class MainWindow(QMainWindow):
@@ -70,10 +91,10 @@ class MainWindow(QMainWindow):
         self.displayed_items: List[OriginalItem] = []
         self.current_original_item: Optional[OriginalItem] = None
         self._updating_selection: bool = False
+        self._has_unsaved_changes: bool = False
 
         self.search_replace_dialog: Optional[SearchReplaceDialog] = None
 
-        # Debounce timer for filter text input
         self.filter_timer = QTimer()
         self.filter_timer.setSingleShot(True)
         self.filter_timer.timeout.connect(self._apply_filter)
@@ -85,7 +106,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
 
-        # Toolbar-like row
         top_row = QHBoxLayout()
         self.btn_load_orig = QPushButton("Dataset")
         self.lbl_orig = QLabel("Dataset: <not set>")
@@ -104,7 +124,6 @@ class MainWindow(QMainWindow):
         self.btn_rescan.clicked.connect(self.rescan_all)
         self.btn_import.clicked.connect(self.import_generated_dialog)
 
-        # Filter textbox row
         filter_row = QHBoxLayout()
         filter_label = QLabel("Filter by words:")
         self.txt_filter = QLineEdit()
@@ -113,7 +132,6 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(filter_label)
         filter_row.addWidget(self.txt_filter, 1)
 
-        # Exclude filter textbox
         exclude_label = QLabel("Exclude by words:")
         self.txt_exclude = QLineEdit()
         self.txt_exclude.setPlaceholderText('Enter words to exclude...')
@@ -121,29 +139,25 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(exclude_label)
         filter_row.addWidget(self.txt_exclude, 1)
 
-        # Search/Replace button
         self.btn_search_replace = QPushButton("Search/Replace")
         self.btn_search_replace.clicked.connect(self.open_search_replace_dialog)
         filter_row.addWidget(self.btn_search_replace)
 
         root_layout.addLayout(filter_row)
 
-        # Main splitter: left list and center splitter
         main_split = QSplitter(Qt.Horizontal)
         main_split.splitterMoved.connect(self._on_splitter_moved)
         root_layout.addWidget(main_split, 1)
 
-        # Left: list of originals
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         self.list_originals = QListWidget()
         self.list_originals.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_originals.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_originals.customContextMenuRequested.connect(self.show_context_menu)
-        self.list_originals.setAutoScroll(False)  # Disable auto-scroll to edges
+        self.list_originals.setAutoScroll(False)
         left_layout.addWidget(self.list_originals)
 
-        # Count label at bottom of list
         self.lbl_list_count = QLabel("0 items")
         self.lbl_list_count.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(self.lbl_list_count)
@@ -151,18 +165,15 @@ class MainWindow(QMainWindow):
         main_split.addWidget(left_widget)
         self.list_originals.itemSelectionChanged.connect(self.on_selection_changed)
 
-        # Center splitter: generated tabs | original image | prompt editor
         center_split = QSplitter(Qt.Horizontal)
         center_split.splitterMoved.connect(self._on_splitter_moved)
         main_split.addWidget(center_split)
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 3)
 
-        # Store splitter references
         self.main_split = main_split
         self.center_split = center_split
 
-        # Generated tabs
         gen_widget = QWidget()
         gen_layout = QVBoxLayout(gen_widget)
         self.tabs_generated = QTabWidget()
@@ -170,23 +181,21 @@ class MainWindow(QMainWindow):
         gen_layout.addWidget(self.tabs_generated)
         center_split.addWidget(gen_widget)
 
-        # Original image
         orig_widget = QWidget()
         orig_layout = QVBoxLayout(orig_widget)
         self.lbl_orig_image = QLabel("Original image will appear here")
         self.lbl_orig_image.setAlignment(Qt.AlignCenter)
         self.lbl_orig_image.setMinimumSize(QSize(200, 200))
-        self.lbl_orig_image.setScaledContents(False)  # Don't stretch, we'll handle scaling manually
+        self.lbl_orig_image.setScaledContents(False)
         orig_layout.addWidget(self.lbl_orig_image, 1)
         center_split.addWidget(orig_widget)
 
-        # Prompt editor
         prompt_widget = QWidget()
         prompt_layout = QVBoxLayout(prompt_widget)
         self.txt_prompt = QPlainTextEdit()
         self.txt_prompt.setPlaceholderText("Edit prompt here...")
+        self.txt_prompt.textChanged.connect(self.on_prompt_text_changed)
         prompt_layout.addWidget(self.txt_prompt, 1)
-        # buttons
         btn_row = QHBoxLayout()
         self.btn_save_prompt = QPushButton("Save Prompt")
         self.btn_rematch = QPushButton("Re-match")
@@ -194,7 +203,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_rematch)
         btn_row.addStretch(1)
 
-        # Font size slider
         font_size_label = QLabel("Font:")
         self.font_slider = QSlider(Qt.Horizontal)
         self.font_slider.setMinimum(MIN_FONT_SIZE)
@@ -214,21 +222,36 @@ class MainWindow(QMainWindow):
         self.btn_save_prompt.clicked.connect(self.save_prompt)
         self.btn_rematch.clicked.connect(self.rematch_with_progress)
 
-        # Add Ctrl+S shortcut for saving prompts
         self.save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
         self.save_shortcut.activated.connect(self.save_prompt)
 
-        # Add Ctrl+F shortcut for search/replace
         self.search_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
         self.search_shortcut.activated.connect(self.open_search_replace_dialog)
 
-        # Add Ctrl+Z shortcut for undo
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.activated.connect(self.undo_prompt_change)
 
-        # Status bar
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
+
+    def on_prompt_text_changed(self) -> None:
+        if self._updating_selection:
+            return
+
+        if not self.current_original_item:
+            return
+
+        current_text = self.txt_prompt.toPlainText().strip()
+        original_text = (self.current_original_item.prompt_text or "").strip()
+
+        if current_text != original_text:
+            if not self._has_unsaved_changes:
+                self._has_unsaved_changes = True
+                self.btn_save_prompt.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold;")
+        else:
+            if self._has_unsaved_changes:
+                self._has_unsaved_changes = False
+                self.btn_save_prompt.setStyleSheet("")
 
     def choose_original(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Original Dataset Folder")
@@ -466,12 +489,10 @@ class MainWindow(QMainWindow):
         exclude_words = []
         phrases = []
 
-        # Extract quoted phrases first (before any splitting)
         phrase_pattern = r'"([^"]+)"'
         for match in re.finditer(phrase_pattern, filter_text):
             phrases.append(match.group(1).lower())
 
-        # Remove quoted phrases from the text before tokenizing
         remaining_text = re.sub(phrase_pattern, '', filter_text)
 
         try:
@@ -499,7 +520,6 @@ class MainWindow(QMainWindow):
 
         self._updating_selection = True
         try:
-            # Save current selection/scroll position
             current_item = self.current_original_item
             current_row = self.list_originals.currentRow()
 
@@ -509,7 +529,6 @@ class MainWindow(QMainWindow):
             include_words, exclude_words, phrases = self._parse_filter_text(self.filter_text)
             has_filter = include_words or exclude_words or phrases
 
-            # Parse exclude filter
             exclude_include_words, exclude_exclude_words, exclude_phrases = self._parse_filter_text(self.exclude_text)
             has_exclude_filter = exclude_include_words or exclude_exclude_words or exclude_phrases
 
@@ -517,7 +536,6 @@ class MainWindow(QMainWindow):
             for item in self.original_items:
                 prompt_lower = (item.prompt_text or "").lower()
 
-                # Apply include filter (Filter by words)
                 if has_filter:
                     if any(word in prompt_lower for word in exclude_words):
                         continue
@@ -528,7 +546,6 @@ class MainWindow(QMainWindow):
                     if phrases and not all(phrase in prompt_lower for phrase in phrases):
                         continue
 
-                # Apply exclude filter (Exclude by words) - skip if ANY word/phrase is found
                 if has_exclude_filter:
                     if exclude_include_words and any(word in prompt_lower for word in exclude_include_words):
                         continue
@@ -548,20 +565,16 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_list_count.setText(f"{displayed_count} items")
 
-            # Restore selection if possible
             if current_item and self.displayed_items:
-                # Try to find the same item in the new list
                 for idx, item in enumerate(self.displayed_items):
                     if item.image_path == current_item.image_path:
                         self.list_originals.setCurrentRow(idx)
                         return
-                # If not found but we had a previous row, try to restore similar position
                 if current_row >= 0:
                     new_row = min(current_row, len(self.displayed_items) - 1)
                     self.list_originals.setCurrentRow(new_row)
                     return
 
-            # Only set to first item if nothing was selected before
             if self.list_originals.count() > 0 and current_row < 0:
                 self.list_originals.setCurrentRow(0)
 
@@ -569,31 +582,25 @@ class MainWindow(QMainWindow):
             self._updating_selection = False
 
     def rematch_with_progress(self) -> None:
-        """Perform matching with progress dialog."""
         if not self.original_items or not self.generated_items:
             return
 
-        # Create progress dialog
         progress = QProgressDialog("Initializing matching...", "Cancel", 0, len(self.original_items), self)
         progress.setWindowTitle("Matching Images to Prompts")
         progress.setWindowModality(Qt.ApplicationModal)
-        progress.setMinimumDuration(0)  # Show immediately
+        progress.setMinimumDuration(0)
         progress.show()
 
-        # Keep track of cancellation
         cancelled = False
 
         def progress_callback(current: int, total: int, message: str) -> bool:
             nonlocal cancelled
 
-            # Update progress dialog
             progress.setValue(current)
             progress.setLabelText(message)
 
-            # Process events to keep UI responsive
             QApplication.processEvents()
 
-            # Check if user cancelled
             if progress.wasCanceled():
                 cancelled = True
                 return False
@@ -601,7 +608,6 @@ class MainWindow(QMainWindow):
             return True
 
         try:
-            # Perform matching with progress reporting
             matches = self.matching_engine.match_all_items(
                 self.original_items,
                 self.generated_items,
@@ -612,10 +618,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Matching cancelled by user", 3000)
                 return
 
-            # Update matches and UI
             self.matches = matches
 
-            # Update list items with match counts
             for row in range(len(self.displayed_items)):
                 item = self.displayed_items[row]
                 match_count = len(self.matches.get(item.image_path, []))
@@ -623,7 +627,6 @@ class MainWindow(QMainWindow):
                 if lw_item is not None:
                     lw_item.setText(self._format_match_count(item.image_path.name, match_count))
 
-            # Refresh current selection
             self.on_selection_changed()
 
             total_matches = sum(len(match_list) for match_list in self.matches.values())
@@ -637,16 +640,39 @@ class MainWindow(QMainWindow):
             progress.close()
 
     def on_selection_changed(self) -> None:
-        """Handle selection changes in the list (supports multi-selection)."""
         if self._updating_selection:
             return
 
+        if self._has_unsaved_changes and self.current_original_item:
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                f"Do you want to save your changes on {self.current_original_item.image_path.name}?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+
+            if reply == QMessageBox.Save:
+                self.save_prompt()
+            elif reply == QMessageBox.Cancel:
+                self._updating_selection = True
+                try:
+                    for idx, item in enumerate(self.displayed_items):
+                        if item.image_path == self.current_original_item.image_path:
+                            self.list_originals.setCurrentRow(idx)
+                            break
+                finally:
+                    self._updating_selection = False
+                return
+
         self._updating_selection = True
         try:
+            self._has_unsaved_changes = False
+            self.btn_save_prompt.setStyleSheet("")
+
             selected_items = self.list_originals.selectedItems()
 
             if not selected_items:
-                # No selection
                 self.lbl_orig_image.clear()
                 self.lbl_orig_image.setText("Original image will appear here")
                 self.txt_prompt.clear()
@@ -654,7 +680,6 @@ class MainWindow(QMainWindow):
                 self.current_original_item = None
                 return
 
-            # Get the first selected item (topmost in list)
             selected_rows = sorted([self.list_originals.row(item) for item in selected_items])
             first_row = selected_rows[0]
 
@@ -675,14 +700,6 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_selection = False
 
-    def on_select_original(self, row: int) -> None:
-        """Legacy method for backward compatibility - redirects to selection changed."""
-        # This is kept for any remaining code that might call it directly
-        if row is None or row < 0:
-            return
-        # Just trigger the selection changed handler
-        self.on_selection_changed()
-
     def _display_original_image(self, item: OriginalItem) -> None:
         pix = self.image_loader.load_for_display(item.image_path, (2000, 2000))
         if pix and not pix.isNull():
@@ -700,34 +717,13 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_orig_image.setText(f"Failed to load: {item.image_path.name}")
 
-    def _scale_generated_image(self, label: QLabel) -> None:
-        pix = label.property("original_pixmap")
-        if pix and not pix.isNull():
-            parent = label.parentWidget()
-            if parent:
-                available_height = parent.height() - 100
-                available_width = parent.width() - 20
-                target_size = QSize(max(100, available_width), max(100, available_height))
-            else:
-                target_size = label.size()
-
-            if target_size.width() > 50 and target_size.height() > 50:
-                scaled_pix = pix.scaled(
-                    target_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                label.setPixmap(scaled_pix)
-            else:
-                label.setPixmap(pix)
-
     def _on_tab_changed(self, index: int) -> None:
         if index >= 0:
             tab_widget = self.tabs_generated.widget(index)
             if tab_widget:
                 for img_label in tab_widget.findChildren(QLabel):
                     if img_label.property("original_pixmap"):
-                        self._scale_generated_image(img_label)
+                        _scale_generated_image(img_label)
 
     def _on_splitter_moved(self, pos: int, index: int) -> None:
         if self.current_original_item:
@@ -739,7 +735,7 @@ class MainWindow(QMainWindow):
             if tab_widget:
                 for img_label in tab_widget.findChildren(QLabel):
                     if img_label.property("original_pixmap"):
-                        self._scale_generated_image(img_label)
+                        _scale_generated_image(img_label)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -752,7 +748,7 @@ class MainWindow(QMainWindow):
             if tab_widget:
                 for img_label in tab_widget.findChildren(QLabel):
                     if img_label.property("original_pixmap"):
-                        self._scale_generated_image(img_label)
+                        _scale_generated_image(img_label)
 
     def populate_generated_tabs(self, items: List[GeneratedItem]) -> None:
         while self.tabs_generated.count() > 0:
@@ -789,7 +785,7 @@ class MainWindow(QMainWindow):
             pix = self.image_loader.load_for_display(g.image_path, (2000, 2000))
             if pix and not pix.isNull():
                 img_label.setProperty("original_pixmap", pix)
-                self._scale_generated_image(img_label)
+                _scale_generated_image(img_label)
             else:
                 img_label.setText(f"Failed to load:\n{g.image_path.name}")
 
@@ -826,7 +822,6 @@ class MainWindow(QMainWindow):
             self.tabs_generated.addTab(info_tab, f"+{len(items) - max_tabs}")
 
     def save_prompt(self) -> None:
-        # Get the first selected item (what's currently displayed)
         selected_items = self.list_originals.selectedItems()
         if not selected_items:
             return
@@ -855,29 +850,27 @@ class MainWindow(QMainWindow):
             if orig_idx is not None:
                 self.rematch_single_item(orig_idx, display_row)
 
+            self._has_unsaved_changes = False
+            self.btn_save_prompt.setStyleSheet("")
+
             self.statusBar().showMessage(f"Saved: {item.prompt_path}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save prompt to {item.prompt_path}:\n{e}")
 
     def on_filter_changed(self, text: str) -> None:
         self.filter_text = text
-        # Restart the debounce timer - only apply filter after typing stops
         self.filter_timer.stop()
         self.filter_timer.start(FILTER_DEBOUNCE_MS)
 
     def on_exclude_changed(self, text: str) -> None:
         self.exclude_text = text
-        # Restart the debounce timer - only apply filter after typing stops
         self.filter_timer.stop()
         self.filter_timer.start(FILTER_DEBOUNCE_MS)
 
     def _apply_filter(self) -> None:
-        """Called after debounce timer expires to actually apply the filter"""
         self.populate_original_list()
 
     def show_context_menu(self, position) -> None:
-        """Show context menu for list widget."""
-        # Only show menu if at least one item is selected
         if not self.list_originals.selectedItems():
             return
 
@@ -892,12 +885,10 @@ class MainWindow(QMainWindow):
         menu.exec(self.list_originals.viewport().mapToGlobal(position))
 
     def select_all_items(self) -> None:
-        """Select all items in the list (respecting current filter)."""
         self.list_originals.selectAll()
         self.statusBar().showMessage(f"Selected {self.list_originals.count()} item(s)", 2000)
 
     def copy_selected_prompts(self) -> None:
-        """Copy selected prompts to clipboard in the format: prompts separated by double newlines."""
         selected_rows = sorted([self.list_originals.row(item) for item in self.list_originals.selectedItems()])
 
         if not selected_rows:
@@ -909,15 +900,12 @@ class MainWindow(QMainWindow):
             if 0 <= row < len(self.displayed_items):
                 item = self.displayed_items[row]
                 if item.prompt_text:
-                    # Clean the prompt: remove all newline characters
                     cleaned_prompt = item.prompt_text.replace("\r\n", "").replace("\r", "").replace("\n", "")
                     prompts.append(cleaned_prompt)
 
         if prompts:
-            # Join prompts with double newline separator
             final_text = "\n\n".join(prompts)
 
-            # Copy to clipboard
             clipboard = QApplication.clipboard()
             clipboard.setText(final_text)
 
@@ -927,13 +915,10 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_match_count(filename: str, match_count: int) -> str:
-        """Format list item text with match count."""
         plural = "es" if match_count != 1 else ""
         return f"{filename}  ({match_count} match{plural})"
 
     def _update_original_item(self, item: OriginalItem, new_text: str) -> None:
-        """Update an original item with new prompt text in both original and displayed lists."""
-        # Update in original_items list
         for idx, orig_item in enumerate(self.original_items):
             if orig_item.image_path == item.image_path:
                 self.original_items[idx] = OriginalItem(
@@ -943,7 +928,6 @@ class MainWindow(QMainWindow):
                 )
                 break
 
-        # Update in displayed_items list
         for idx, disp_item in enumerate(self.displayed_items):
             if disp_item.image_path == item.image_path:
                 self.displayed_items[idx] = OriginalItem(
@@ -1054,7 +1038,6 @@ class MainWindow(QMainWindow):
             self.prompt_manager.save_prompt(item, new_text)
             self._update_original_item(item, new_text)
 
-            # Find original index for rematching
             orig_idx = next((idx for idx, orig_item in enumerate(self.original_items)
                            if orig_item.image_path == item.image_path), None)
 
@@ -1078,13 +1061,10 @@ class MainWindow(QMainWindow):
         try:
             prompt_path.write_text(old_text, encoding="utf-8")
 
-            # Find the item to update
             for idx, orig_item in enumerate(self.original_items):
                 if orig_item.prompt_path == prompt_path:
-                    # Update both lists
                     self._update_original_item(orig_item, old_text)
 
-                    # Update UI if currently displayed
                     for display_row, disp_item in enumerate(self.displayed_items):
                         if disp_item.prompt_path == prompt_path:
                             if self.list_originals.currentRow() == display_row:

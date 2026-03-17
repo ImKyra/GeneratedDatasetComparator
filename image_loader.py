@@ -9,7 +9,6 @@ try:
 except Exception:
     raise SystemExit("Pillow is required. Please install with: pip install Pillow")
 
-# Constants
 DEFAULT_MAX_SIZE = (1200, 1200)
 MAX_CACHE_SIZE = 15
 
