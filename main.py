@@ -3,6 +3,7 @@ import sys
 import difflib
 import shlex
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -795,16 +796,15 @@ class MainWindow(QMainWindow):
             file_info.setTextFormat(Qt.PlainText)
             layout.addWidget(file_info)
 
-            snippet = (g.prompt_text or "<no prompt in metadata>").strip()
-            if len(snippet) > 150:
-                snippet = snippet[:150] + "..."
+            prompt_text = (g.prompt_text or "<no prompt in metadata>").strip()
 
-            snippet_label = QLabel()
-            snippet_label.setTextFormat(Qt.PlainText)
-            snippet_label.setText(snippet)
-            snippet_label.setWordWrap(True)
-            snippet_label.setMaximumHeight(60)
-            layout.addWidget(snippet_label, 0)
+            prompt_display = QPlainTextEdit()
+            prompt_display.setPlainText(prompt_text)
+            prompt_display.setReadOnly(True)
+            prompt_display.setMaximumHeight(80)
+            prompt_display.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            prompt_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            layout.addWidget(prompt_display, 0)
 
             tab_name = g.image_path.stem
             if len(tab_name) > 12:
@@ -822,16 +822,15 @@ class MainWindow(QMainWindow):
             self.tabs_generated.addTab(info_tab, f"+{len(items) - max_tabs}")
 
     def save_prompt(self) -> None:
-        selected_items = self.list_originals.selectedItems()
-        if not selected_items:
+        if not self.current_original_item:
             return
 
-        selected_rows = sorted([self.list_originals.row(item) for item in selected_items])
-        display_row = selected_rows[0]
+        item = self.current_original_item
+        display_row = next((idx for idx, disp_item in enumerate(self.displayed_items)
+                           if disp_item.image_path == item.image_path), -1)
 
-        if display_row < 0 or display_row >= len(self.displayed_items):
+        if display_row < 0:
             return
-        item = self.displayed_items[display_row]
         old_text = item.prompt_text
         new_text = self.txt_prompt.toPlainText().strip()
 
@@ -882,6 +881,9 @@ class MainWindow(QMainWindow):
         copy_prompts_action = menu.addAction("Copy prompt(s)")
         copy_prompts_action.triggered.connect(self.copy_selected_prompts)
 
+        open_image_action = menu.addAction("Open image with default application")
+        open_image_action.triggered.connect(self.open_image_with_default_app)
+
         menu.exec(self.list_originals.viewport().mapToGlobal(position))
 
     def select_all_items(self) -> None:
@@ -912,6 +914,34 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Copied {len(prompts)} prompt(s) to clipboard", 3000)
         else:
             self.statusBar().showMessage("No prompts found in selected items", 2000)
+
+    def open_image_with_default_app(self) -> None:
+        selected_rows = sorted([self.list_originals.row(item) for item in self.list_originals.selectedItems()])
+
+        if not selected_rows:
+            self.statusBar().showMessage("No items selected", 2000)
+            return
+
+        first_row = selected_rows[0]
+        if 0 <= first_row < len(self.displayed_items):
+            item = self.displayed_items[first_row]
+            image_path = item.image_path
+
+            if not image_path.exists():
+                QMessageBox.warning(self, "File Not Found", f"Image file not found:\n{image_path}")
+                return
+
+            try:
+                if sys.platform == "win32":
+                    os.startfile(str(image_path))
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(image_path)], check=True)
+                else:
+                    subprocess.run(["xdg-open", str(image_path)], check=True)
+
+                self.statusBar().showMessage(f"Opened: {image_path.name}", 2000)
+            except Exception as e:
+                QMessageBox.critical(self, "Open Error", f"Failed to open image:\n{e}")
 
     @staticmethod
     def _format_match_count(filename: str, match_count: int) -> str:
