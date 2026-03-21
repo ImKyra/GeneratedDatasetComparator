@@ -1,13 +1,7 @@
 import os
 import sys
-import difflib
-import shlex
-import re
-import subprocess
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import shutil
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut, QResizeEvent, QCloseEvent
@@ -40,34 +34,16 @@ from image_loader import ImageLoader
 from prompt_manager import PromptManager
 from matching_engine import MatchingEngine
 from search_replace_dialog import SearchReplaceDialog
+from context_menu_actions import ContextMenuActions
+from import_manager import ImportManager
+from filter_manager import FilterManager
+from ui_display_manager import UIDisplayManager
+from prompt_editor import PromptEditor
 
-MAX_GENERATED_TABS = 8
 FILTER_DEBOUNCE_MS = 300
 DEFAULT_FONT_SIZE = 10
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 24
-
-
-def _scale_generated_image(label: QLabel) -> None:
-    pix = label.property("original_pixmap")
-    if pix and not pix.isNull():
-        parent = label.parentWidget()
-        if parent:
-            available_height = parent.height() - 100
-            available_width = parent.width() - 20
-            target_size = QSize(max(100, available_width), max(100, available_height))
-        else:
-            target_size = label.size()
-
-        if target_size.width() > 50 and target_size.height() > 50:
-            scaled_pix = pix.scaled(
-                target_size,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            label.setPixmap(scaled_pix)
-        else:
-            label.setPixmap(pix)
 
 
 class MainWindow(QMainWindow):
@@ -101,6 +77,17 @@ class MainWindow(QMainWindow):
         self.filter_timer.timeout.connect(self._apply_filter)
 
         self._build_ui()
+
+        # Initialize managers (must be after _build_ui since they reference UI elements)
+        self.context_menu_actions = ContextMenuActions(self.list_originals, self.statusBar())
+        self.import_manager = ImportManager(self.scanner, self.statusBar())
+        self.filter_manager = FilterManager()
+        self.ui_display = UIDisplayManager(
+            self.image_loader,
+            self.lbl_orig_image,
+            self.tabs_generated
+        )
+        self.prompt_editor = PromptEditor(self.prompt_manager, self.statusBar())
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -294,6 +281,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Found {len(self.generated_items)} generated images ({has_prompt} with prompts). Click 'Scan/Match' to match.", 5000)
 
     def import_generated_dialog(self) -> None:
+        """Open dialog to import generated images from external source."""
         if not self.generated_root:
             QMessageBox.warning(
                 self,
@@ -301,6 +289,7 @@ class MainWindow(QMainWindow):
                 "Please select a generated dataset folder first using 'Load Generated Folder'."
             )
             return
+
         dest_path = QFileDialog.getExistingDirectory(
             self,
             "Select Destination Folder for Import"
@@ -310,146 +299,33 @@ class MainWindow(QMainWindow):
 
         dest_folder = Path(dest_path)
 
-        if any(dest_folder.iterdir()):
-            timestamp = datetime.now().strftime("%y%m%d%H%M%S")
-            target_dir = dest_folder / f"generated.{timestamp}"
-            try:
-                target_dir.mkdir(parents=True, exist_ok=False)
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Import Error",
-                    f"Failed to create timestamped directory:\n{e}"
-                )
-                return
+        # Create timestamped directory if needed
+        target_dir = self.import_manager.create_timestamped_directory(dest_folder)
+        if target_dir is None:
+            QMessageBox.critical(
+                self,
+                "Import Error",
+                "Failed to create timestamped directory"
+            )
+            return
 
-            self.statusBar().showMessage(f"Destination not empty. Created: {target_dir.name}", 3000)
-        else:
-            target_dir = dest_folder
+        # Perform the import
+        imported, skipped, unmatched = self.import_manager.import_generated_files(
+            self.generated_root,
+            target_dir,
+            self.original_items
+        )
 
-        self.import_generated_files(self.generated_root, target_dir)
-
+        # Update UI
         self.generated_root = target_dir
         self.lbl_gen.setText(f"Generated: {self.generated_root}")
         self.statusBar().showMessage("Import complete. Click 'Scan/Match' to scan.", 3000)
 
-    def import_generated_files(self, source_dir: Path, target_dir: Path) -> None:
-        self.statusBar().showMessage("Importing generated files...")
-        QApplication.processEvents()
-
-        source_items: List[GeneratedItem] = []
-        for dirpath, _, filenames in os.walk(source_dir):
-            for fname in filenames:
-                ext = Path(fname).suffix.lower()
-                if ext in GENERATED_IMG_EXTS:
-                    p = Path(dirpath) / fname
-                    prompt = self.scanner.load_image_metadata_prompt_png(p)
-                    source_items.append(GeneratedItem(image_path=p, prompt_text=prompt))
-
-        if not source_items:
-            QMessageBox.information(self, "Import", "No generated images found in selected folder.")
-            return
-
-        orig_by_stem: Dict[str, OriginalItem] = {}
-        for orig in self.original_items:
-            stem = orig.image_path.stem.lower()
-            orig_by_stem[stem] = orig
-
-        orig_norm_map: Dict[Path, str] = {}
-        for orig in self.original_items:
-            norm = self.scanner._normalize_prompt(orig.prompt_text)
-            if norm:
-                orig_norm_map[orig.image_path] = norm
-
-        imported_count = 0
-        skipped_count = 0
-        unmatched_count = 0
-
-        for gen_item in source_items:
-            gen_stem = gen_item.image_path.stem.lower()
-            target_name = None
-            matched_orig: Optional[OriginalItem] = None
-
-            # Try to match by filename stem first
-            if gen_stem in orig_by_stem:
-                matched_orig = orig_by_stem[gen_stem]
-                target_name = matched_orig.image_path.stem + gen_item.image_path.suffix
-
-            # If no filename match, try to match by prompt metadata
-            if not matched_orig and gen_item.prompt_text:
-                gen_norm = self.scanner._normalize_prompt(gen_item.prompt_text)
-                if gen_norm:
-                    best_match: Optional[OriginalItem] = None
-                    best_score = 0.0
-
-                    for orig in self.original_items:
-                        orig_norm = orig_norm_map.get(orig.image_path)
-                        if not orig_norm:
-                            continue
-
-                        if gen_norm == orig_norm or gen_norm in orig_norm or orig_norm in gen_norm:
-                            best_match = orig
-                            best_score = 1.0
-                            break
-
-                        len_diff = abs(len(orig_norm) - len(gen_norm)) / max(len(orig_norm), len(gen_norm), 1)
-                        if len_diff > 0.5:
-                            continue
-
-                        o_words = set(orig_norm.split())
-                        g_words = set(gen_norm.split())
-                        if not o_words or not g_words:
-                            continue
-
-                        word_overlap = len(o_words & g_words) / len(o_words | g_words)
-                        if word_overlap < 0.3:
-                            continue
-
-                        score = difflib.SequenceMatcher(None, orig_norm, gen_norm).ratio()
-                        if score >= 0.85 and score > best_score:
-                            best_score = score
-                            best_match = orig
-
-                    if best_match:
-                        matched_orig = best_match
-                        target_name = matched_orig.image_path.stem + gen_item.image_path.suffix
-
-            # Skip if no match found
-            if not matched_orig or not target_name:
-                unmatched_count += 1
-                continue
-
-            target_path = target_dir / target_name
-
-            if target_path.exists():
-                if target_path.resolve() == gen_item.image_path.resolve():
-                    skipped_count += 1
-                    continue
-                base_stem = Path(target_name).stem
-                ext = Path(target_name).suffix
-                counter = 1
-                while target_path.exists():
-                    target_name = f"{base_stem}_{counter}{ext}"
-                    target_path = target_dir / target_name
-                    counter += 1
-
-            try:
-                shutil.copy2(gen_item.image_path, target_path)
-                imported_count += 1
-            except Exception as e:
-                error_msg = f"Failed to copy {gen_item.image_path.name}: {e}"
-                print(error_msg)
-                self.statusBar().showMessage(error_msg, 5000)
-
-        self.statusBar().showMessage(
-            f"Import complete: {imported_count} imported, {skipped_count} skipped, {unmatched_count} unmatched",
-            5000
-        )
-
-        if imported_count > 0 or unmatched_count > 0:
-            message = f"Successfully imported {imported_count} file(s) to:\n{target_dir}\n\n"
-            message += f"Skipped: {skipped_count} (already exist)\n"
-            message += f"Unmatched: {unmatched_count} (no corresponding original dataset item found)"
+        # Show results
+        if imported > 0 or unmatched > 0:
+            message = f"Successfully imported {imported} file(s) to:\n{target_dir}\n\n"
+            message += f"Skipped: {skipped} (already exist)\n"
+            message += f"Unmatched: {unmatched} (no corresponding original dataset item found)"
 
             QMessageBox.information(
                 self,
@@ -485,37 +361,8 @@ class MainWindow(QMainWindow):
         if self.original_root and self.generated_root:
             self.rematch_with_progress()
 
-    def _parse_filter_text(self, filter_text: str) -> Tuple[List[str], List[str], List[str]]:
-        include_words = []
-        exclude_words = []
-        phrases = []
-
-        phrase_pattern = r'"([^"]+)"'
-        for match in re.finditer(phrase_pattern, filter_text):
-            phrases.append(match.group(1).lower())
-
-        remaining_text = re.sub(phrase_pattern, '', filter_text)
-
-        try:
-            tokens = shlex.split(remaining_text.lower())
-        except ValueError:
-            tokens = remaining_text.lower().split()
-
-        for token in tokens:
-            token = token.strip()
-            if not token:
-                continue
-
-            if token.startswith('-'):
-                exclude_word = token[1:].strip()
-                if exclude_word:
-                    exclude_words.append(exclude_word)
-            else:
-                include_words.append(token)
-
-        return include_words, exclude_words, phrases
-
     def populate_original_list(self) -> None:
+        """Populate the list widget with filtered original items."""
         if self._updating_selection:
             return
 
@@ -527,45 +374,31 @@ class MainWindow(QMainWindow):
             self.list_originals.clear()
             self.displayed_items.clear()
 
-            include_words, exclude_words, phrases = self._parse_filter_text(self.filter_text)
-            has_filter = include_words or exclude_words or phrases
+            # Filter items using FilterManager
+            filtered_items = self.filter_manager.filter_items(
+                self.original_items,
+                self.filter_text,
+                self.exclude_text
+            )
 
-            exclude_include_words, exclude_exclude_words, exclude_phrases = self._parse_filter_text(self.exclude_text)
-            has_exclude_filter = exclude_include_words or exclude_exclude_words or exclude_phrases
-
-            displayed_count = 0
-            for item in self.original_items:
-                prompt_lower = (item.prompt_text or "").lower()
-
-                if has_filter:
-                    if any(word in prompt_lower for word in exclude_words):
-                        continue
-
-                    if include_words and not all(word in prompt_lower for word in include_words):
-                        continue
-
-                    if phrases and not all(phrase in prompt_lower for phrase in phrases):
-                        continue
-
-                if has_exclude_filter:
-                    if exclude_include_words and any(word in prompt_lower for word in exclude_include_words):
-                        continue
-
-                    if exclude_phrases and any(phrase in prompt_lower for phrase in exclude_phrases):
-                        continue
-
+            # Populate list with filtered items
+            for item in filtered_items:
                 match_count = len(self.matches.get(item.image_path, []))
                 lw = QListWidgetItem(self._format_match_count(item.image_path.name, match_count))
                 self.list_originals.addItem(lw)
                 self.displayed_items.append(item)
-                displayed_count += 1
 
+            # Update count label
+            displayed_count = len(filtered_items)
             total_count = len(self.original_items)
-            if has_filter or has_exclude_filter:
+            has_filters = self.filter_text or self.exclude_text
+
+            if has_filters:
                 self.lbl_list_count.setText(f"{displayed_count} of {total_count} items (filtered)")
             else:
                 self.lbl_list_count.setText(f"{displayed_count} items")
 
+            # Restore selection if possible
             if current_item and self.displayed_items:
                 for idx, item in enumerate(self.displayed_items):
                     if item.image_path == current_item.image_path:
@@ -674,10 +507,9 @@ class MainWindow(QMainWindow):
             selected_items = self.list_originals.selectedItems()
 
             if not selected_items:
-                self.lbl_orig_image.clear()
-                self.lbl_orig_image.setText("Original image will appear here")
+                self.ui_display.clear_original_image()
                 self.txt_prompt.clear()
-                self.populate_generated_tabs([])
+                self.ui_display.populate_generated_tabs([])
                 self.current_original_item = None
                 return
 
@@ -687,141 +519,35 @@ class MainWindow(QMainWindow):
             if 0 <= first_row < len(self.displayed_items):
                 item = self.displayed_items[first_row]
                 self.current_original_item = item
-                self.lbl_orig_image.clear()
-                self._display_original_image(item)
+                self.ui_display.display_original_image(item)
                 self.txt_prompt.setPlainText(item.prompt_text or "")
-                self.populate_generated_tabs(self.matches.get(item.image_path, []))
+                self.ui_display.populate_generated_tabs(self.matches.get(item.image_path, []))
             else:
-                self.lbl_orig_image.clear()
-                self.lbl_orig_image.setText("Original image will appear here")
+                self.ui_display.clear_original_image()
                 self.txt_prompt.clear()
-                self.populate_generated_tabs([])
+                self.ui_display.populate_generated_tabs([])
                 self.current_original_item = None
 
         finally:
             self._updating_selection = False
 
-    def _display_original_image(self, item: OriginalItem) -> None:
-        pix = self.image_loader.load_for_display(item.image_path, (2000, 2000))
-        if pix and not pix.isNull():
-            label_size = self.lbl_orig_image.size()
-            if label_size.width() > 50 and label_size.height() > 50:
-                scaled_pix = pix.scaled(
-                    label_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                self.lbl_orig_image.setPixmap(scaled_pix)
-            else:
-                self.lbl_orig_image.setPixmap(pix)
-            self.lbl_orig_image.setText("")
-        else:
-            self.lbl_orig_image.setText(f"Failed to load: {item.image_path.name}")
-
     def _on_tab_changed(self, index: int) -> None:
-        if index >= 0:
-            tab_widget = self.tabs_generated.widget(index)
-            if tab_widget:
-                for img_label in tab_widget.findChildren(QLabel):
-                    if img_label.property("original_pixmap"):
-                        _scale_generated_image(img_label)
+        """Handle tab change events to rescale images."""
+        self.ui_display.rescale_current_tab_images()
 
     def _on_splitter_moved(self, pos: int, index: int) -> None:
-        if self.current_original_item:
-            self._display_original_image(self.current_original_item)
-
-        current_tab_idx = self.tabs_generated.currentIndex()
-        if current_tab_idx >= 0:
-            tab_widget = self.tabs_generated.widget(current_tab_idx)
-            if tab_widget:
-                for img_label in tab_widget.findChildren(QLabel):
-                    if img_label.property("original_pixmap"):
-                        _scale_generated_image(img_label)
+        """Handle splitter movement to rescale images."""
+        self.ui_display.rescale_original_image(self.current_original_item)
+        self.ui_display.rescale_current_tab_images()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
+        """Handle window resize events to rescale images."""
         super().resizeEvent(event)
-        if self.current_original_item:
-            self._display_original_image(self.current_original_item)
-
-        current_tab_idx = self.tabs_generated.currentIndex()
-        if current_tab_idx >= 0:
-            tab_widget = self.tabs_generated.widget(current_tab_idx)
-            if tab_widget:
-                for img_label in tab_widget.findChildren(QLabel):
-                    if img_label.property("original_pixmap"):
-                        _scale_generated_image(img_label)
-
-    def populate_generated_tabs(self, items: List[GeneratedItem]) -> None:
-        while self.tabs_generated.count() > 0:
-            widget = self.tabs_generated.widget(0)
-            self.tabs_generated.removeTab(0)
-            if widget:
-                for child in widget.findChildren(QLabel):
-                    child.clear()
-                widget.deleteLater()
-
-        if not items:
-            placeholder = QWidget()
-            layout = QVBoxLayout(placeholder)
-            no_match_label = QLabel("No matching generated images found.")
-            no_match_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(no_match_label)
-            self.tabs_generated.addTab(placeholder, "None")
-            return
-
-        max_tabs = min(len(items), MAX_GENERATED_TABS)
-        items_to_show = items[:max_tabs]
-
-        for i, g in enumerate(items_to_show):
-            tab = QWidget()
-            layout = QVBoxLayout(tab)
-            layout.setContentsMargins(5, 5, 5, 5)
-
-            img_label = QLabel()
-            img_label.setAlignment(Qt.AlignCenter)
-            img_label.setScaledContents(False)
-            img_label.setMinimumSize(100, 100)
-            img_label.setSizePolicy(img_label.sizePolicy().horizontalPolicy(), img_label.sizePolicy().verticalPolicy())
-
-            pix = self.image_loader.load_for_display(g.image_path, (2000, 2000))
-            if pix and not pix.isNull():
-                img_label.setProperty("original_pixmap", pix)
-                _scale_generated_image(img_label)
-            else:
-                img_label.setText(f"Failed to load:\n{g.image_path.name}")
-
-            layout.addWidget(img_label, 1)
-
-            file_info = QLabel(f"File: {g.image_path.name}")
-            file_info.setTextFormat(Qt.PlainText)
-            layout.addWidget(file_info)
-
-            prompt_text = (g.prompt_text or "<no prompt in metadata>").strip()
-
-            prompt_display = QPlainTextEdit()
-            prompt_display.setPlainText(prompt_text)
-            prompt_display.setReadOnly(True)
-            prompt_display.setMaximumHeight(80)
-            prompt_display.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            prompt_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            layout.addWidget(prompt_display, 0)
-
-            tab_name = g.image_path.stem
-            if len(tab_name) > 12:
-                tab_name = tab_name[:9] + "..."
-            self.tabs_generated.addTab(tab, tab_name)
-
-        if len(items) > max_tabs:
-            info_tab = QWidget()
-            info_layout = QVBoxLayout(info_tab)
-            info_label = QLabel(
-                f"Showing {max_tabs} of {len(items)} matches.\nScroll through original list to see others.")
-            info_label.setAlignment(Qt.AlignCenter)
-            info_label.setWordWrap(True)
-            info_layout.addWidget(info_label)
-            self.tabs_generated.addTab(info_tab, f"+{len(items) - max_tabs}")
+        self.ui_display.rescale_original_image(self.current_original_item)
+        self.ui_display.rescale_current_tab_images()
 
     def save_prompt(self) -> None:
+        """Save the current prompt to file."""
         if not self.current_original_item:
             return
 
@@ -831,16 +557,19 @@ class MainWindow(QMainWindow):
 
         if display_row < 0:
             return
-        old_text = item.prompt_text
+
         new_text = self.txt_prompt.toPlainText().strip()
 
-        if old_text == new_text:
-            self.statusBar().showMessage("No changes to save", 2000)
-            return
-
-        try:
-            self.prompt_manager.save_prompt(item, new_text)
-            self._update_original_item(item, new_text)
+        # Save the prompt
+        if self.prompt_editor.save_prompt(item, new_text, self):
+            # Update item in all lists
+            updated_item = self.prompt_editor.update_item_prompt(
+                item,
+                new_text,
+                self.original_items,
+                self.displayed_items
+            )
+            self.current_original_item = updated_item
 
             # Find original index for rematching
             orig_idx = next((idx for idx, orig_item in enumerate(self.original_items)
@@ -851,10 +580,6 @@ class MainWindow(QMainWindow):
 
             self._has_unsaved_changes = False
             self.btn_save_prompt.setStyleSheet("")
-
-            self.statusBar().showMessage(f"Saved: {item.prompt_path}", 3000)
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Failed to save prompt to {item.prompt_path}:\n{e}")
 
     def on_filter_changed(self, text: str) -> None:
         self.filter_text = text
@@ -870,102 +595,41 @@ class MainWindow(QMainWindow):
         self.populate_original_list()
 
     def show_context_menu(self, position) -> None:
+        """Display context menu for the original items list."""
         if not self.list_originals.selectedItems():
             return
 
         menu = QMenu(self)
 
         select_all_action = menu.addAction("Select All")
-        select_all_action.triggered.connect(self.select_all_items)
+        select_all_action.triggered.connect(self.context_menu_actions.select_all_items)
 
         copy_prompts_action = menu.addAction("Copy prompt(s)")
-        copy_prompts_action.triggered.connect(self.copy_selected_prompts)
+        copy_prompts_action.triggered.connect(
+            lambda: self.context_menu_actions.copy_selected_prompts(self.displayed_items)
+        )
+
+        copy_files_action = menu.addAction("Copy file(s) and prompt(s) to...")
+        copy_files_action.triggered.connect(
+            lambda: self.context_menu_actions.copy_files_and_prompts(self.displayed_items, self)
+        )
+
+        move_files_action = menu.addAction("Move file(s) and prompt(s) to...")
+        move_files_action.triggered.connect(
+            lambda: self.context_menu_actions.move_files_and_prompts(self.displayed_items, self)
+        )
 
         open_image_action = menu.addAction("Open image with default application")
-        open_image_action.triggered.connect(self.open_image_with_default_app)
+        open_image_action.triggered.connect(
+            lambda: self.context_menu_actions.open_image_with_default_app(self.displayed_items, self)
+        )
 
         menu.exec(self.list_originals.viewport().mapToGlobal(position))
-
-    def select_all_items(self) -> None:
-        self.list_originals.selectAll()
-        self.statusBar().showMessage(f"Selected {self.list_originals.count()} item(s)", 2000)
-
-    def copy_selected_prompts(self) -> None:
-        selected_rows = sorted([self.list_originals.row(item) for item in self.list_originals.selectedItems()])
-
-        if not selected_rows:
-            self.statusBar().showMessage("No items selected", 2000)
-            return
-
-        prompts = []
-        for row in selected_rows:
-            if 0 <= row < len(self.displayed_items):
-                item = self.displayed_items[row]
-                if item.prompt_text:
-                    cleaned_prompt = item.prompt_text.replace("\r\n", "").replace("\r", "").replace("\n", "")
-                    prompts.append(cleaned_prompt)
-
-        if prompts:
-            final_text = "\n\n".join(prompts)
-
-            clipboard = QApplication.clipboard()
-            clipboard.setText(final_text)
-
-            self.statusBar().showMessage(f"Copied {len(prompts)} prompt(s) to clipboard", 3000)
-        else:
-            self.statusBar().showMessage("No prompts found in selected items", 2000)
-
-    def open_image_with_default_app(self) -> None:
-        selected_rows = sorted([self.list_originals.row(item) for item in self.list_originals.selectedItems()])
-
-        if not selected_rows:
-            self.statusBar().showMessage("No items selected", 2000)
-            return
-
-        first_row = selected_rows[0]
-        if 0 <= first_row < len(self.displayed_items):
-            item = self.displayed_items[first_row]
-            image_path = item.image_path
-
-            if not image_path.exists():
-                QMessageBox.warning(self, "File Not Found", f"Image file not found:\n{image_path}")
-                return
-
-            try:
-                if sys.platform == "win32":
-                    os.startfile(str(image_path))
-                elif sys.platform == "darwin":
-                    subprocess.run(["open", str(image_path)], check=True)
-                else:
-                    subprocess.run(["xdg-open", str(image_path)], check=True)
-
-                self.statusBar().showMessage(f"Opened: {image_path.name}", 2000)
-            except Exception as e:
-                QMessageBox.critical(self, "Open Error", f"Failed to open image:\n{e}")
 
     @staticmethod
     def _format_match_count(filename: str, match_count: int) -> str:
         plural = "es" if match_count != 1 else ""
         return f"{filename}  ({match_count} match{plural})"
-
-    def _update_original_item(self, item: OriginalItem, new_text: str) -> None:
-        for idx, orig_item in enumerate(self.original_items):
-            if orig_item.image_path == item.image_path:
-                self.original_items[idx] = OriginalItem(
-                    image_path=item.image_path,
-                    prompt_path=item.prompt_path,
-                    prompt_text=new_text
-                )
-                break
-
-        for idx, disp_item in enumerate(self.displayed_items):
-            if disp_item.image_path == item.image_path:
-                self.displayed_items[idx] = OriginalItem(
-                    image_path=item.image_path,
-                    prompt_path=item.prompt_path,
-                    prompt_text=new_text
-                )
-                break
 
     def rematch_single_item(self, orig_idx: int, display_row: int = -1) -> None:
         if orig_idx < 0 or orig_idx >= len(self.original_items):
@@ -982,7 +646,7 @@ class MainWindow(QMainWindow):
                 lw_item.setText(self._format_match_count(item.image_path.name, match_count))
 
             if self.list_originals.currentRow() == display_row:
-                self.populate_generated_tabs(result)
+                self.ui_display.populate_generated_tabs(result)
 
     def on_font_size_changed(self, value: int) -> None:
         self.font_size_label.setText(f"{value}pt")
@@ -1006,31 +670,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Filtered by: {search_text}", 3000)
 
     def on_replace_requested(self, search_text: str, replace_text: str, case_sensitive: bool) -> None:
+        """Handle replace request from search/replace dialog."""
         display_row = self.list_originals.currentRow()
         if display_row < 0 or display_row >= len(self.displayed_items):
             self.statusBar().showMessage("No prompt selected", 2000)
             return
 
         item = self.displayed_items[display_row]
-        old_prompt = item.prompt_text or ""
 
-        if case_sensitive:
-            new_prompt = old_prompt.replace(search_text, replace_text)
-        else:
-            new_prompt = self.prompt_manager.case_insensitive_replace(old_prompt, search_text, replace_text)
+        # Perform the replace
+        new_prompt, count = self.prompt_editor.perform_search_replace(
+            item,
+            search_text,
+            replace_text,
+            case_sensitive
+        )
 
-        if new_prompt == old_prompt:
+        if new_prompt == (item.prompt_text or ""):
             self.statusBar().showMessage(f"'{search_text}' not found in current prompt", 3000)
             return
 
-        self.prompt_manager.add_to_history(item.prompt_path, old_prompt)
+        # Add to undo history and save
+        self.prompt_editor.add_to_history(item.prompt_path, item.prompt_text or "")
         self.txt_prompt.setPlainText(new_prompt)
         self._save_prompt_internal(item, new_prompt, display_row)
 
-        count = old_prompt.count(search_text) if case_sensitive else old_prompt.lower().count(search_text.lower())
         self.statusBar().showMessage(f"Replaced {count} occurrence(s) in current prompt", 3000)
 
     def on_replace_all_requested(self, search_text: str, replace_text: str, case_sensitive: bool) -> None:
+        """Handle replace all request from search/replace dialog."""
         if not self.displayed_items:
             self.statusBar().showMessage("No items to replace", 2000)
             return
@@ -1039,21 +707,21 @@ class MainWindow(QMainWindow):
         total_occurrences = 0
 
         for display_row, item in enumerate(self.displayed_items):
-            old_prompt = item.prompt_text or ""
+            # Perform the replace
+            new_prompt, count = self.prompt_editor.perform_search_replace(
+                item,
+                search_text,
+                replace_text,
+                case_sensitive
+            )
 
-            if case_sensitive:
-                new_prompt = old_prompt.replace(search_text, replace_text)
-                count = old_prompt.count(search_text)
-            else:
-                new_prompt = self.prompt_manager.case_insensitive_replace(old_prompt, search_text, replace_text)
-                count = old_prompt.lower().count(search_text.lower())
-
-            if new_prompt != old_prompt:
-                self.prompt_manager.add_to_history(item.prompt_path, old_prompt)
+            if new_prompt != (item.prompt_text or ""):
+                self.prompt_editor.add_to_history(item.prompt_path, item.prompt_text or "")
                 self._save_prompt_internal(item, new_prompt, display_row)
                 replaced_count += 1
                 total_occurrences += count
 
+        # Update current display
         current_row = self.list_originals.currentRow()
         if 0 <= current_row < len(self.displayed_items):
             self.txt_prompt.setPlainText(self.displayed_items[current_row].prompt_text or "")
@@ -1064,37 +732,43 @@ class MainWindow(QMainWindow):
         )
 
     def _save_prompt_internal(self, item: OriginalItem, new_text: str, display_row: int) -> None:
-        try:
-            self.prompt_manager.save_prompt(item, new_text)
-            self._update_original_item(item, new_text)
+        """Internal method to save prompt without user interaction."""
+        if self.prompt_editor.save_prompt_internal(item, new_text):
+            # Update item in all lists
+            self.prompt_editor.update_item_prompt(
+                item,
+                new_text,
+                self.original_items,
+                self.displayed_items
+            )
 
+            # Rematch
             orig_idx = next((idx for idx, orig_item in enumerate(self.original_items)
                            if orig_item.image_path == item.image_path), None)
 
             if orig_idx is not None:
                 self.rematch_single_item(orig_idx, display_row)
 
-        except Exception as e:
-            print(f"Failed to save prompt to {item.prompt_path}: {e}")
-
     def undo_prompt_change(self) -> None:
-        if not self.prompt_manager.has_history():
-            self.statusBar().showMessage("No changes to undo", 2000)
-            return
-
-        result = self.prompt_manager.undo()
+        """Undo the last prompt change."""
+        result = self.prompt_editor.undo_last_change(self.original_items, self)
         if not result:
             return
 
-        prompt_path, old_text = result
+        prompt_path, old_text, orig_item = result
 
-        try:
-            prompt_path.write_text(old_text, encoding="utf-8")
+        if orig_item:
+            # Update item in all lists
+            self.prompt_editor.update_item_prompt(
+                orig_item,
+                old_text,
+                self.original_items,
+                self.displayed_items
+            )
 
-            for idx, orig_item in enumerate(self.original_items):
-                if orig_item.prompt_path == prompt_path:
-                    self._update_original_item(orig_item, old_text)
-
+            # Find and rematch
+            for idx, item in enumerate(self.original_items):
+                if item.prompt_path == prompt_path:
                     for display_row, disp_item in enumerate(self.displayed_items):
                         if disp_item.prompt_path == prompt_path:
                             if self.list_originals.currentRow() == display_row:
@@ -1103,23 +777,11 @@ class MainWindow(QMainWindow):
                             break
                     break
 
-            self.statusBar().showMessage(f"Undone: {prompt_path.name}", 3000)
-
-        except Exception as e:
-            QMessageBox.critical(self, "Undo Error", f"Failed to undo changes to {prompt_path}:\n{e}")
-
     def closeEvent(self, event: QCloseEvent) -> None:
+        """Clean up resources when closing the window."""
         try:
-            self.lbl_orig_image.clear()
-
-            while self.tabs_generated.count() > 0:
-                widget = self.tabs_generated.widget(0)
-                self.tabs_generated.removeTab(0)
-                if widget:
-                    for child in widget.findChildren(QLabel):
-                        child.clear()
-                    widget.deleteLater()
-
+            self.ui_display.clear_original_image()
+            self.ui_display.populate_generated_tabs([])
             self.image_loader.clear_cache()
             QApplication.processEvents()
         except Exception:
